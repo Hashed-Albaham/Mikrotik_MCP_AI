@@ -22,3 +22,11 @@
 Homestead.json
 Homestead.yaml
 Thumbs.db
+
+# Database files - NEVER commit these!
+*.sqlite
+*.sqlite3
+database/*.sqlite
+database/*.sqlite3
+*.sql
+*.dump

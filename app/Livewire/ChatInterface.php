@@ -1,5 +1,7 @@
 <?php
 
+// 🛡️ SEC: Strict types prevent type confusion attacks [source:2]
+declare(strict_types=1);
 namespace App\Livewire;
 
 use Livewire\Component;
@@ -23,6 +25,7 @@ class ChatInterface extends Component
 
     public $routers = [];
     public $activeRouterId;
+    public $activeToolName = ''; // For UI Feedback
     public $connectionStatus = null; // 'success' or 'error'
     public $connectionMessage = '';
 
@@ -41,7 +44,7 @@ class ChatInterface extends Component
         $lastProviderId = session('active_provider_id');
         
         if (!$lastProviderId) {
-             $lastSession = ChatSession::where('user_id', 1)->latest()->first();
+             $lastSession = ChatSession::where('user_id', auth()->id() ?? 1)->latest()->first();
              $lastProviderId = $lastSession ? $lastSession->provider_id : ($this->availableProviders->first()->id ?? 1);
         }
 
@@ -50,11 +53,11 @@ class ChatInterface extends Component
         // 2. Resolve Chat Session
         // We'll try to resume the latest session to keep history, or create new if explicitly requested (logic can be added later)
         // For now, let's just get the latest session for this user.
-        $session = ChatSession::where('user_id', 1)->latest()->first();
+        $session = ChatSession::where('user_id', auth()->id() ?? 1)->latest()->first();
         
         if (!$session) {
             $session = ChatSession::create([
-                'user_id' => 1,
+                'user_id' => auth()->id() ?? 1,
                 'provider_id' => $this->activeProviderId,
                 'title' => 'New Session - ' . now()->format('H:i')
             ]);
@@ -142,7 +145,7 @@ class ChatInterface extends Component
         
         // Create new session
         $session = ChatSession::create([
-            'user_id' => 1,
+            'user_id' => auth()->id() ?? 1, // FIXED: Dynamic user_id
             'provider_id' => $this->activeProviderId,
             'title' => 'New Session - ' . now()->format('H:i')
         ]);
@@ -172,40 +175,36 @@ class ChatInterface extends Component
             ->toArray();
     }
 
-    public function sendMessage(AiOrchestrator $ai, $content = null)
+    /**
+     * Submit User Message (Instant UI Feedback)
+     */
+    public function submitMessage()
     {
-        $userMsgContent = $content ?? $this->input;
-        
-        if (empty(trim($userMsgContent))) return;
+        $content = $this->input;
+        if (empty(trim($content)) && !$this->upload) return;
 
-        // Reset input if it hasn't been cleared by frontend yet
+        // Reset Input Immediately
         $this->input = '';
         $this->isTyping = true;
-        
-        // Handle Attachment (OCR/Vision)
+
+        // Handle File Attachment (OCR)
         $attachmentContent = '';
         if ($this->upload) {
-            Log::info("ChatInterface: File upload detected.", ['name' => $this->upload->getClientOriginalName()]);
             try {
-                // Determine Provider
                 $provider = \App\Models\AiProvider::find($this->activeProviderId);
-                
-                // OCR / Text Extraction
+                // Simple placeholder for now, actual processing happens in generation if needed
+                // But for speed, let's process it here or queue it. 
+                // Let's do it here for simplicity, file upload naturally takes a moment.
+                $ai = app(AiOrchestrator::class); 
                 $extracted = $ai->processOCR($provider, $this->upload);
-                Log::info("ChatInterface: OCR Extracted.", ['length' => strlen($extracted)]);
-                
                 $attachmentContent = "\n\n[Attached File Content]:\n" . $extracted;
-                
-                $this->upload = null; // Clear after processing
+                $this->upload = null;
             } catch (\Exception $e) {
-                Log::error("ChatInterface: File Processing Error: " . $e->getMessage());
-                $attachmentContent = "\n\n[Error reading file: " . $e->getMessage() . "]";
+                $attachmentContent = "\n\n[Error: " . $e->getMessage() . "]";
             }
-        } else {
-             Log::info("ChatInterface: No upload detected.");
         }
         
-        $fullContent = $userMsgContent . $attachmentContent;
+        $fullContent = $content . $attachmentContent;
 
         // 1. Save User Message
         ChatMessage::create([
@@ -214,34 +213,74 @@ class ChatInterface extends Component
             'content' => $fullContent
         ]);
 
-        $this->loadMessages();
-        
-        try { // Restored try block
+        // 2. Create Placeholder Assistant Message (The "Thinking" Bubble)
+        $assistantMsg = ChatMessage::create([
+            'session_id' => $this->sessionId,
+            'role' => 'assistant',
+            'content' => '', // Empty content triggers "Thinking..." UI
+        ]);
 
-            // 2. Prepare Validated History (Fixes 3230 Error by filtering broken turns)
+        // 3. Trigger AI Generation (Async-ish via Livewire Event)
+        $this->dispatch('generate-ai-response', messageId: $assistantMsg->id);
+        
+        // Refresh UI
+        $this->loadMessages(); 
+        $this->dispatch('message-sent'); // Scroll to bottom
+    }
+
+    /**
+     * Generate AI Response (Streaming)
+     */
+    #[\Livewire\Attributes\On('generate-ai-response')] 
+    public function generateResponse($messageId)
+    {
+        $assistantMsg = ChatMessage::find($messageId);
+        if (!$assistantMsg) return;
+
+        $ai = app(AiOrchestrator::class);
+        $this->isTyping = true;
+
+        try {
             $history = $this->getValidHistory();
             
-            // 3. Configure AI Service with Selected Provider
+            // Allow AI to see the empty placeholder? No, remove it from history sent to AI
+            // We need to exclude the very last assistant message (which is empty) from history
+            // Actually getValidHistory handles typical message flow. Let's ensure we don't send the empty one.
+            // The empty one is the last one in DB.
+             array_pop($history); 
+
             $provider = \App\Models\AiProvider::find($this->activeProviderId);
-            if ($provider) {
-                $ai->setProvider($provider);
+            if ($provider) $ai->setProvider($provider);
+
+            // Get the User Message (Previous to this assistant message)
+            $lastUserMsg = ChatMessage::where('session_id', $this->sessionId)
+                ->where('role', 'user')
+                ->latest()
+                ->first();
+                
+            $userContent = $lastUserMsg ? $lastUserMsg->content : '';
+
+            // Start Streaming
+            $stream = $ai->sendStream($userContent, $history);
+            $accumulatedContent = '';
+
+            foreach ($stream as $chunk) {
+                $accumulatedContent .= $chunk;
+                $this->stream(
+                    to: "msg-{$assistantMsg->id}-content", 
+                    content: $chunk, 
+                    replace: false
+                );
             }
 
-            // 4. Call AI Service
-            // Note: AiOrchestrator::send returns an array compatible with OpenAI format
-            $response = $ai->send($userMsgContent, $history);
-            
-            $content = $response['choices'][0]['message']['content'] ?? '';
-            $toolCalls = $response['choices'][0]['message']['tool_calls'] ?? null;
+            // Handle Tool Calls
+            $toolCalls = $stream->getReturn(); 
             $uiWidget = null;
 
-            // 5. Handle Tool Calls (The AI wants to do something)
-            if ($toolCalls) {
+            if (!empty($toolCalls)) {
                 foreach ($toolCalls as $toolCall) {
                     $fnName = $toolCall['function']['name'] ?? 'unknown';
-                    Log::info("ChatInterface: AI requested tool '$fnName'", ['args' => $toolCall['function']['arguments'] ?? '']);
                     
-                    // If AI wants to generate vouchers, we show the Form Widget first
                     if ($fnName === 'generate_hotspot_vouchers') {
                         $uiWidget = [
                             'type' => 'form',
@@ -252,32 +291,38 @@ class ChatInterface extends Component
                                 ['name' => 'server', 'label' => 'Hotspot Server', 'type' => 'text', 'default' => 'all']
                             ]
                         ];
-                        // If content is empty but we have a tool, add a default message
-                        if (empty($content)) $content = "I can help with that. Please confirm the details below:";
+                        if (empty($accumulatedContent)) $accumulatedContent = "Please confirm the details below:";
                     }
+                     // Dispatch Auto-Tool Trigger if applicable
+                     if ($fnName === 'execute_router_command') {
+                         $args = json_decode($toolCall['function']['arguments'] ?? '{}', true);
+                         $this->dispatch('trigger-auto-tool', 
+                             tool: $fnName,
+                             id: $toolCall['id'] ?? uniqid(),
+                             args: $args
+                         );
+                     }
                 }
             }
 
-            // 6. Save Assistant Response
-            ChatMessage::create([
-                'session_id' => $this->sessionId,
-                'role' => 'assistant',
-                'content' => $content,
+            // Finalize Message
+            $assistantMsg->update([
+                'content' => $accumulatedContent,
                 'tool_calls' => $toolCalls,
                 'ui_widget' => $uiWidget
             ]);
 
         } catch (\Exception $e) {
             Log::error($e);
-            ChatMessage::create([
-                'session_id' => $this->sessionId,
-                'role' => 'system',
-                'content' => "AI Connection Error: " . $e->getMessage() . ". Ensure your AI Provider settings are correct in the Admin Panel."
-            ]);
+            $assistantMsg->update(['content' => "Error: " . $e->getMessage()]);
+            $this->stream(
+                to: "msg-{$assistantMsg->id}-content", 
+                content: "Error: " . $e->getMessage(),
+                replace: true
+            );
         }
 
         $this->isTyping = false;
-        $this->loadMessages();
         $this->dispatch('message-sent');
     }
 
@@ -286,33 +331,23 @@ class ChatInterface extends Component
      */
     public function handleAutoToolExecution($toolName, $toolCallId, $args)
     {
-        // 1. Validate
+        // 1. Set Feedback for UI
+        $this->activeToolName = $args['command'] ?? $toolName;
+        
+        // 2. Validate
         if ($toolName !== 'execute_router_command') return;
 
-        // 2. Log "Thinking" / System Message
-        // We might want to show this briefly or just have it in history.
-        // User requested "Thinking" visualization.
-        // We can add a "system" message that shows the command being executed.
-        
-        $this->messages[] = [
-            'id' => uniqid(),
-            'role' => 'system',
-            'content' => "🤖 Executing: " . ($args['command'] ?? 'Unknown Command') . "...",
-            'ui_widget' => null, 
-            'tool_calls' => null
-        ];
-        
-        // Save to DB to persist this "thought"
+        // 3. Create System Message (Audit Log)
         ChatMessage::create([
             'session_id' => $this->sessionId,
             'role' => 'system',
-            'content' => "Executing: " . ($args['command'] ?? 'Unknown Command')
+            'content' => "⚙️ Executing: " . ($args['command'] ?? 'Unknown Command')
         ]);
-
+        
         $output = "Error: Tool execution failed.";
 
         try {
-            // 3. Execute Tool
+            // 4. Execute Tool
             $tool = new \App\Mcp\Tools\ExecuteRouterCommandTool();
             $routerId = $this->activeRouterId ?? \App\Models\Router::first()->id ?? null;
             
@@ -358,81 +393,90 @@ class ChatInterface extends Component
     public function continueConversation()
     {
         $this->isTyping = true;
-        // RELOAD MESSAGES FIRST to get the LATEST state from DB (including the tool output just saved)
+        $this->activeToolName = ''; // Clear "Executing..." status
         $this->loadMessages();
         
         try {
             // CHECK: Do we have pending tool calls?
-            // If the last assistant message had multiple calls (e.g. 2 calls), 
-            // we must ensure we have 2 'tool' messages following it before replying.
-            
+            // ... (Keep existing Logic for 3230 check) ...
             $messages = collect($this->messages);
             $lastAssistantMsg = $messages->where('role', 'assistant')->last();
             
             if ($lastAssistantMsg && !empty($lastAssistantMsg['tool_calls'])) {
+                // ... (Existing validation logic) ...
+                // Re-implementing the validation check briefly for connection context:
                 $toolCalls = $lastAssistantMsg['tool_calls'];
+                if (is_string($toolCalls)) $toolCalls = json_decode($toolCalls, true);
                 
-                // Fallback: If for some reason casting didn't work, decode it manually.
-                if (is_string($toolCalls)) {
-                    $toolCalls = json_decode($toolCalls, true);
-                }
-
                 if (is_array($toolCalls)) {
                     $callCount = count($toolCalls);
-                    Log::info("Debug 3230: Found Last Assistant Msg [{$lastAssistantMsg['id']}] with $callCount tool calls.");
-                    
-                    // Count how many 'tool' messages exist AFTER this assistant message
                     $allMsgIds = array_column($this->messages, 'id');
                     $lastAssistantIndex = array_search($lastAssistantMsg['id'], $allMsgIds);
                     
                     if ($lastAssistantIndex !== false) {
                         $subsequentToolMsgs = 0;
                         for ($i = $lastAssistantIndex + 1; $i < count($this->messages); $i++) {
-                            if ($this->messages[$i]['role'] === 'tool') {
-                                $subsequentToolMsgs++;
-                            }
+                            if ($this->messages[$i]['role'] === 'tool') $subsequentToolMsgs++;
                         }
-                        
-                        Log::info("Debug 3230: Found $subsequentToolMsgs subsequent tool responses.");
-
-                        // LOGIC: If we have fewer answers than questions, STOP.
                         if ($subsequentToolMsgs < $callCount) {
-                            Log::info("ChatInterface: STOPPING. Waiting for all tool outputs. ($subsequentToolMsgs / $callCount)");
                             $this->isTyping = false; 
-                            return; // EXIT. Wait for next tool output.
-                        } else {
-                            Log::info("Debug 3230: Count matches. Proceeding to call AI.");
+                            return; // EXIT
                         }
                     }
-                } else {
-                     Log::warning("Debug 3230: tool_calls is not an array or valid JSON", ['raw' => $lastAssistantMsg['tool_calls']]);
                 }
             }
             
             $ai = app(AiOrchestrator::class);
-            
-            // 2. Prepare Validated History
             $history = $this->getValidHistory();
             
-            // Configure Provider
             $provider = \App\Models\AiProvider::find($this->activeProviderId);
             if ($provider) $ai->setProvider($provider);
 
-            // Pass generic confirmation. 
-            // In OpenAI, you usually send the tool outputs and get a response immediately.
-            // The 'user' message is optional if the last msg was 'tool'.
-            // However, AiOrchestrator::send wrapper usually forces a user msg.
-            // Let's rely on standard flow.
-            $response = $ai->send("Tool outputs submitted.", $history);
-            
-            $content = $response['choices'][0]['message']['content'] ?? '';
-            $toolCalls = $response['choices'][0]['message']['tool_calls'] ?? null;
-             
-            ChatMessage::create([
+            // Create Placeholder for the NEXT response
+            $assistantMsg = ChatMessage::create([
                 'session_id' => $this->sessionId,
                 'role' => 'assistant',
-                'content' => $content,
-                'tool_calls' => $toolCalls
+                'content' => '', 
+            ]);
+            $this->loadMessages();
+
+            // Stream Response
+            // Pass empty string as message, relying on history (which has tool outputs) 
+            $stream = $ai->sendStream("", $history); 
+            $accumulatedContent = '';
+
+            foreach ($stream as $chunk) {
+                $accumulatedContent .= $chunk;
+                $this->stream(
+                    to: "msg-{$assistantMsg->id}-content", 
+                    content: $chunk, 
+                    replace: false
+                );
+            }
+
+            // Handle Tool Calls (Recursion)
+            $toolCalls = $stream->getReturn(); 
+            $uiWidget = null;
+
+            if (!empty($toolCalls)) {
+                foreach ($toolCalls as $toolCall) {
+                    $fnName = $toolCall['function']['name'] ?? 'unknown';
+                    // Auto-execute logic
+                     if ($fnName === 'execute_router_command') {
+                         $args = json_decode($toolCall['function']['arguments'] ?? '{}', true);
+                         $this->dispatch('trigger-auto-tool', 
+                             tool: $fnName,
+                             id: $toolCall['id'] ?? uniqid(),
+                             args: $args
+                         );
+                     }
+                }
+            }
+
+            $assistantMsg->update([
+                'content' => $accumulatedContent,
+                'tool_calls' => $toolCalls,
+                'ui_widget' => $uiWidget
             ]);
             
         } catch (\Exception $e) {
@@ -445,7 +489,6 @@ class ChatInterface extends Component
         }
         
         $this->isTyping = false;
-        $this->loadMessages();
         $this->dispatch('message-sent');
     }
 

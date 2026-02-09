@@ -1,10 +1,13 @@
 <?php
 
+// 🛡️ SEC: Strict types prevent type confusion attacks [source:2]
+declare(strict_types=1);
 namespace App\Services\Ai;
 
 use App\Models\AiProvider;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\RateLimiter;
 use Exception;
 use App\Models\McpTool;
 
@@ -25,6 +28,12 @@ class AiOrchestrator
      */
     public function send(string $message, array $history = [], ?string $providerId = null): array
     {
+        // FIXED: Rate limiting to prevent API abuse (60 requests per minute per user)
+        $rateLimitKey = 'ai-request:' . (auth()->id() ?? 'guest');
+        if (!RateLimiter::attempt($rateLimitKey, 60, fn() => true, 60)) {
+            throw new Exception("Too many AI requests. Please wait a moment before trying again.");
+        }
+
         // 1. Resolve Provider
         // Priority: Manually set provider -> Method argument -> Active/Default DB provider
         $provider = $this->activeProvider 
@@ -57,16 +66,17 @@ class AiOrchestrator
         // 5. Hardcoded Fallback System Prompt for "Agentic" capabilities
         $sysPrompt = $provider->system_instruction;
         if (empty($sysPrompt)) {
-            $sysPrompt = "You are an advanced Network Automation Agent. You have access to a POWERFUL tool called `execute_router_command`. 
-            
-            CRITICAL RULES:
-            1. If the user asks for multiple things (e.g., 'Check status AND hotspot'), execute the first command, then IMMEDIATELY execute the next command in the next turn. DO NOT stop to ask 'Should I continue?'. Just do it.
-            2. ALWAYS execute the command. Do not just say 'I will do it'. Attach the tool call immediately.
-            3. If you need to run multiple commands to answer a question, run them one by one.
-            4. Output the results clearly after execution.";
+            $sysPrompt = "أنت مساعد شبكات ذكي متقدم (Network Automation Agent). لديك صلاحية الوصول إلى أداة قوية تسمى `execute_router_command`.
+
+            القواعد الصارمة (System Rules):
+            1. اللغة: يجب أن يكون ردك وفهمك وكل نقاشك باللغة العربية الفصحى أو التقنية المفهومة.
+            2. التنفيذ الفوري: نفذ الأوامر فوراً.
+            3. التنسيق (مهم جداً): عند عرض حالة الراوتر أو الموارد (مثل /system/resource/print)، **يجب** عرض البيانات في جدول Markdown منظم واحترافي. لا تعرضها كنص خام أبدًا.
+            4. الشفافية: قبل أو بعد عرض الجدول، اذكر بوضوح: 'تم تنفيذ الأمر: [الأمر المنفذ]'.
+            5. السياق: أنت تعرف حالة الراوتر (CPU, RAM, Uptime) إذا توفرت البيانات، استخدمها في تحليلك.";
         } else {
              // Append reinforcement
-             $sysPrompt .= " REMEMBER: Execute ALL requested actions immediately. Do not wait for confirmation.";
+             $sysPrompt .= " تذكير: اعرض البيانات في جداول Markdown. اذكر الأمر المنفذ.";
         }
 
         array_unshift($messages, ['role' => 'system', 'content' => $sysPrompt]);
@@ -83,20 +93,21 @@ class AiOrchestrator
             $payload['tools'] = $tools;
         }
 
-        // Debugging 401 Error
+        // FIXED: Removed sensitive token logging - Security Risk
         Log::info("Sending to AI Provider [ID: {$provider->id}]", [
             'url' => $provider->base_url . '/chat/completions',
             'model' => $payload['model'],
-            'token_preview' => substr($provider->api_key, 0, 5) . '...' . substr($provider->api_key, -5),
-            'token_length' => strlen($provider->api_key)
         ]);
 
-        // 5. Send Request
+        // FIXED: SSL verification is environment-aware (only disabled in local dev)
+        // FIX: Remove trailing slash from base_url to avoid double slashes
+        $baseUrl = rtrim($provider->base_url, '/');
+        
         $response = Http::timeout(120)
             ->connectTimeout(30)
-            ->withoutVerifying() // Fix for Localhost cURL SSL issues
+            ->when(app()->isLocal(), fn($r) => $r->withoutVerifying())
             ->withToken(trim($provider->api_key)) 
-            ->baseUrl($provider->base_url)
+            ->baseUrl($baseUrl)
             ->post('/chat/completions', $payload);
 
         if ($response->failed()) {
@@ -104,6 +115,101 @@ class AiOrchestrator
         }
 
         return $response->json();
+    }
+
+    /**
+     * STREAMING: Send message and return a generator for SSE/Livewire.
+     * This allows "typing effect" in the UI.
+     */
+    public function sendStream(string $message, array $history = [], ?string $providerId = null)
+    {
+        // 1. Resolve Provider (Same logic as send)
+        $rateLimitKey = 'ai-request:' . (auth()->id() ?? 'guest');
+        if (!RateLimiter::attempt($rateLimitKey, 60, fn() => true, 60)) {
+            throw new Exception("Too many AI requests. Please wait.");
+        }
+
+        $provider = $this->activeProvider 
+            ?? ($providerId ? AiProvider::find($providerId) : null) 
+            ?? AiProvider::where('is_active', true)->first();
+
+        if (!$provider) throw new Exception("No active AI Provider configured.");
+
+        // 2. Prepare Payload
+        $messages = $history;
+        $sysPrompt = $provider->system_instruction ?? "You are an advanced Network Automation Agent. Execute commands immediately if requested.";
+        array_unshift($messages, ['role' => 'system', 'content' => $sysPrompt]);
+        $messages[] = ['role' => 'user', 'content' => $message];
+
+        $payload = [
+            'model' => $provider->model_identifier,
+            'messages' => $messages,
+            'temperature' => 0.7,
+            'stream' => true, // ENABLE STREAMING
+        ];
+
+        // Add Tools if supported
+        $tools = [];
+        if ($provider->supports_tools && $provider->type !== 'gemini_interaction') {
+            $tools = $this->getFormattedTools();
+            if(!empty($tools)) $payload['tools'] = $tools;
+        }
+
+        // 3. Send Stream Request
+        $baseUrl = rtrim($provider->base_url, '/');
+        
+        $response = Http::timeout(120)
+            ->connectTimeout(30)
+            ->withOptions(['stream' => true]) // LARAVEL HTTP STREAM OPTION
+            ->when(app()->isLocal(), fn($r) => $r->withoutVerifying())
+            ->withToken(trim($provider->api_key)) 
+            ->baseUrl($baseUrl)
+            ->post('/chat/completions', $payload);
+
+        if ($response->failed()) throw new Exception("Stream Request Failed: " . $response->body());
+
+        // 4. Yield Chunks
+        $body = $response->toPsrResponse()->getBody();
+        $toolCallsBuffer = [];
+
+        while (!$body->eof()) {
+            $line = \App\Services\Ai\StreamParser::readLine($body);
+            if ($line === null) break; 
+            
+            // Parse SSE format "data: {...}"
+            if (str_starts_with($line, 'data: ')) {
+                $json = substr($line, 6);
+                if (trim($json) === '[DONE]') break;
+                
+                $data = json_decode($json, true);
+                
+                // Yield Content
+                if (isset($data['choices'][0]['delta']['content'])) {
+                    yield $data['choices'][0]['delta']['content'];
+                }
+
+                // Accumulate Tool Calls
+                if (isset($data['choices'][0]['delta']['tool_calls'])) {
+                    foreach ($data['choices'][0]['delta']['tool_calls'] as $tc) {
+                        $idx = $tc['index'] ?? 0; // Fix: Default to 0 if index is missing
+                        
+                        if (!isset($toolCallsBuffer[$idx])) {
+                            $toolCallsBuffer[$idx] = [
+                                'id' => $tc['id'] ?? '',
+                                'type' => 'function',
+                                'function' => ['name' => $tc['function']['name'] ?? '', 'arguments' => '']
+                            ];
+                        }
+                        
+                        if (isset($tc['id'])) $toolCallsBuffer[$idx]['id'] = $tc['id'];
+                        if (isset($tc['function']['name'])) $toolCallsBuffer[$idx]['function']['name'] = $tc['function']['name'];
+                        if (isset($tc['function']['arguments'])) $toolCallsBuffer[$idx]['function']['arguments'] .= $tc['function']['arguments'];
+                    }
+                }
+            }
+        }
+        
+        return $toolCallsBuffer;
     }
 
     /**

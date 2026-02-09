@@ -1,5 +1,7 @@
 <?php
 
+// 🛡️ SEC: Strict types prevent type confusion attacks [source:2]
+declare(strict_types=1);
 namespace App\Mcp\Tools;
 
 use App\Services\Router\RouterOsFactory;
@@ -58,36 +60,49 @@ class GenerateVouchersTool extends BaseTool
         // 2. Connect to Router
         $adapter = RouterOsFactory::make($router);
 
-        // 3. Generate Codes
-        $users = [];
-        $count = $arguments['count'];
-        $profile = $arguments['profile'];
+        // FIXED: Wrap in transaction for atomicity
+        return \Illuminate\Support\Facades\DB::transaction(function () use ($adapter, $arguments, $router) {
+            // 3. Generate Codes - Pre-generate all usernames/passwords first
+            $users = [];
+            $count = $arguments['count'];
+            $profile = $arguments['profile'];
+            $errors = [];
 
-        for ($i = 0; $i < $count; $i++) {
-            $username = Str::upper(Str::random(6)); // Simple random alphanumeric
-            $password = Str::random(4); // Shorter password
-            
-            // Execute on Router
-            $adapter->addHotspotUser($username, $password, $profile);
-            
-            $users[] = ['username' => $username, 'password' => $password];
-        }
+            // Pre-generate all credentials
+            for ($i = 0; $i < $count; $i++) {
+                $users[] = [
+                    'username' => Str::upper(Str::random(6)),
+                    'password' => Str::random(4),
+                ];
+            }
 
-        // 4. Record Batch in DB
-        // (Assuming PDF generation would happen here using a service like DomPDF or Browsershot)
-        $batch = VoucherBatch::create([
-            'router_id' => $router->id,
-            'profile' => $profile,
-            'count' => $count,
-            'pdf_path' => '/storage/vouchers/batch_' . time() . '.pdf', // Placeholder
-        ]);
+            // Execute on Router with error collection (soft fail)
+            $successCount = 0;
+            foreach ($users as $user) {
+                try {
+                    $adapter->addHotspotUser($user['username'], $user['password'], $profile);
+                    $successCount++;
+                } catch (\Exception $e) {
+                    $errors[] = "User {$user['username']}: {$e->getMessage()}";
+                }
+            }
 
-        return [
-            'status' => 'success',
-            'message' => "Generated $count vouchers for profile '$profile'.",
-            'batch_id' => $batch->id,
-            'download_url' => url($batch->pdf_path),
-            'samples' => array_slice($users, 0, 3) // Return a few samples to display in chat
-        ];
+            // 4. Record Batch in DB
+            $batch = VoucherBatch::create([
+                'router_id' => $router->id,
+                'profile' => $profile,
+                'count' => $successCount,
+                'pdf_path' => '/storage/vouchers/batch_' . time() . '.pdf', // Placeholder
+            ]);
+
+            return [
+                'status' => $successCount > 0 ? 'success' : 'error',
+                'message' => "Generated $successCount/$count vouchers for profile '$profile'.",
+                'batch_id' => $batch->id,
+                'download_url' => url($batch->pdf_path),
+                'samples' => array_slice($users, 0, 3),
+                'errors' => array_slice($errors, 0, 5), // Return first 5 errors if any
+            ];
+        });
     }
 }

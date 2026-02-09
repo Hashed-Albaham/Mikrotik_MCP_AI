@@ -26,6 +26,13 @@ git init
 
 :add_files
 echo [2/5] Adding files (this might take a moment)...
+
+:: 🛡️ SECURITY: Untrack sensitive files if they were accidentally added before
+git rm --cached .env >nul 2>nul
+git rm --cached database/*.sqlite >nul 2>nul
+git rm --cached *.sqlite >nul 2>nul
+git rm --cached *.log >nul 2>nul
+
 git add .
 
 echo [3/5] Committing files with timestamp...

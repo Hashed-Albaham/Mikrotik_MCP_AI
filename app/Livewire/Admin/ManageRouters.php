@@ -1,5 +1,7 @@
 <?php
 
+// 🛡️ SEC: Strict types prevent type confusion attacks [source:2]
+declare(strict_types=1);
 namespace App\Livewire\Admin;
 
 use Livewire\Component;
@@ -27,7 +29,7 @@ class ManageRouters extends Component
         $this->isModalOpen = true;
     }
 
-    public function edit($id)
+    public function edit($id): void
     {
         $router = Router::find($id);
         $this->routerId = $id;
@@ -35,7 +37,9 @@ class ManageRouters extends Component
         $this->host = $router->host;
         $this->port = $router->port;
         $this->username = $router->username;
-        $this->password = $router->password;
+        // 🛡️ SEC: Don't expose decrypted password in frontend [source:1]
+        // Leave password empty - user only enters new password if changing
+        $this->password = '';
         
         $this->isEditing = true;
         $this->isModalOpen = true;
@@ -57,7 +61,7 @@ class ManageRouters extends Component
         $this->validate($validationRules);
 
         $data = [
-            'user_id' => 1,
+            'user_id' => auth()->id(), // FIXED: Dynamic user_id
             'name' => $this->name,
             'host' => $this->host,
             // Removed ip_address as it is not in schema
@@ -70,7 +74,11 @@ class ManageRouters extends Component
         }
 
         if ($this->isEditing) {
-            Router::find($this->routerId)->update($data);
+            // FIXED: Authorization check - only owner can update
+            Router::where('id', $this->routerId)
+                ->where('user_id', auth()->id())
+                ->firstOrFail()
+                ->update($data);
             session()->flash('message', 'Router Updated Successfully.');
         } else {
             Router::create($data);
@@ -82,7 +90,10 @@ class ManageRouters extends Component
 
     public function delete($id)
     {
-        Router::find($id)->delete();
+        // FIXED: Authorization check - only owner can delete
+        Router::where('id', $id)
+            ->where('user_id', auth()->id())
+            ->delete();
         session()->flash('message', 'Router Deleted Successfully.');
     }
 

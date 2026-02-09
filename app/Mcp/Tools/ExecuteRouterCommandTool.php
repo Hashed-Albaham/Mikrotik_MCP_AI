@@ -1,5 +1,7 @@
 <?php
 
+// 🛡️ SEC: Strict types prevent type confusion attacks [source:2]
+declare(strict_types=1);
 namespace App\Mcp\Tools;
 
 use App\Services\Router\RouterOsFactory;
@@ -8,6 +10,152 @@ use Exception;
 
 class ExecuteRouterCommandTool extends BaseTool
 {
+    /**
+     * ENHANCED: Comprehensive RouterOS API Whitelist
+     * Based on official MikroTik API documentation
+     * Organized by module for maintainability
+     */
+    private const ALLOWED_COMMAND_PATTERNS = [
+        // === System Module ===
+        '/^\/system\/resource/',      // CPU, memory, uptime
+        '/^\/system\/identity/',      // Router name
+        '/^\/system\/clock/',         // Date/time
+        '/^\/system\/health/',        // Hardware health
+        '/^\/system\/routerboard/',   // Hardware info
+        '/^\/system\/package/',       // Installed packages
+        '/^\/system\/license/',       // License info
+        '/^\/system\/history/',       // Command history
+        '/^\/system\/note/',          // System notes
+        '/^\/system\/ntp/',           // NTP client settings
+        '/^\/system\/logging/',       // Logging settings (read only)
+        
+        // === Interface Module ===
+        '/^\/interface\/print/',
+        '/^\/interface\/getall/',
+        '/^\/interface\/listen/',
+        '/^\/interface\/set/',
+        '/^\/interface\/ethernet/',
+        '/^\/interface\/vlan/',
+        '/^\/interface\/bridge/',
+        '/^\/interface\/bonding/',
+        '/^\/interface\/wireless/',
+        '/^\/interface\/lte/',
+        '/^\/interface\/pppoe-client/',
+        '/^\/interface\/pptp-client/',
+        '/^\/interface\/l2tp-client/',
+        '/^\/interface\/ovpn-client/',
+        '/^\/interface\/wireguard/',
+        
+        // === IP Module ===
+        '/^\/ip\/address/',
+        '/^\/ip\/route/',
+        '/^\/ip\/arp/',
+        '/^\/ip\/neighbor/',
+        '/^\/ip\/dns/',
+        '/^\/ip\/pool/',
+        '/^\/ip\/dhcp-server/',
+        '/^\/ip\/dhcp-client/',
+        '/^\/ip\/firewall\/filter/',
+        '/^\/ip\/firewall\/nat/',
+        '/^\/ip\/firewall\/mangle/',
+        '/^\/ip\/firewall\/address-list/',
+        '/^\/ip\/firewall\/connection/',
+        '/^\/ip\/hotspot/',
+        '/^\/ip\/service/',          // View services only
+        '/^\/ip\/cloud/',
+        '/^\/ip\/proxy/',
+        '/^\/ip\/ipsec/',
+        
+        // === Routing Module ===
+        '/^\/routing\/ospf/',
+        '/^\/routing\/bgp/',
+        '/^\/routing\/rip/',
+        '/^\/routing\/filter/',
+        '/^\/routing\/table/',
+        
+        // === Queue Module ===
+        '/^\/queue\/simple/',
+        '/^\/queue\/tree/',
+        '/^\/queue\/type/',
+        
+        // === User & Access Module ===
+        '/^\/user\/active/',
+        '/^\/user\/print/',          // List users (not modify)
+        '/^\/user\/group/',
+        
+        // === Wireless & CAPsMAN ===
+        '/^\/caps-man/',
+        '/^\/interface\/wifiwave2/',
+        
+        // === PPP & VPN ===
+        '/^\/ppp\/active/',
+        '/^\/ppp\/profile/',
+        '/^\/ppp\/secret/',          // Manage PPP users
+        '/^\/ppp\/aaa/',
+        
+        // === Tools (Safe) ===
+        '/^\/tool\/ping/',
+        '/^\/tool\/traceroute/',
+        '/^\/tool\/bandwidth-test/',
+        '/^\/tool\/torch/',
+        '/^\/tool\/netwatch/',
+        '/^\/tool\/e-mail/',         // Email notifications
+        '/^\/tool\/sniffer/',        // Packet capture
+        '/^\/tool\/profile/',        // CPU profiler
+        
+        // === Logs & Certificates ===
+        '/^\/log\/print/',
+        '/^\/certificate/',
+        
+        // === RADIUS ===
+        '/^\/radius/',
+        
+        // === SNMP ===
+        '/^\/snmp/',
+    ];
+
+    /**
+     * ENHANCED: Blocked dangerous commands
+     * These will be rejected even if they match allowed patterns
+     */
+    private const BLOCKED_PATTERNS = [
+        // Configuration export/import (data exfiltration risk)
+        '/export/',
+        '/import/',
+        
+        // Script execution (code injection)
+        '/script/',
+        '/scheduler/',
+        '/environment/',
+        
+        // Credential access
+        '/password/',
+        '/secret.*=/',            // Setting secrets
+        '/api-key/',
+        '/private-key/',
+        
+        // System destructive
+        '/backup/',
+        '/reset-configuration/',
+        '/system\/reboot/',
+        '/system\/shutdown/',
+        '/system\/upgrade/',
+        '/system\/package\/downgrade/',
+        
+        // File system access
+        '/file/',
+        '/fetch/',                // Download files
+        
+        // System User management (write) - 🛡️ More specific to not block hotspot users
+        '/^\\/user\\/add/',        // System users only (starts with /user)
+        '/^\\/user\\/set/',        // System users only
+        '/^\\/user\\/remove/',     // System users only
+        
+        // SSH/Console access
+        '/system\\/ssh/',
+        '/console/',
+    ];
+
     public function name(): string
     {
         return 'execute_router_command';
@@ -38,6 +186,9 @@ class ExecuteRouterCommandTool extends BaseTool
             'command' => 'required|string',
         ]);
 
+        // FIXED: Validate command against security whitelist
+        $this->validateCommand($arguments['command']);
+
         if (!$routerId) {
             throw new Exception("No router selected.");
         }
@@ -50,80 +201,16 @@ class ExecuteRouterCommandTool extends BaseTool
         try {
             $adapter = RouterOsFactory::make($router);
             
-            // The command might be a "scipt" command or a direct API call.
-            // RouterOS API treats specific paths as menus.
-            // However, to support "arbitrary" CLI-like commands, it's often best to use /system/ssh/exec or just map standard API calls.
-            // But strict API requires breaking down the command (e.g. /ip/address/add).
-            // Many AI models write CLI commands.
-            // We need a way to run CLI syntax or force AI to use structure.
-            // For robust "Agentic" behavior, sending exact API structure is harder for LLMs without strict schema.
-            // Best approach for "Power User" AI: Use the 'terminal' approach if possible, or try to parse.
-            // BUT, our Adapter likely expects parsed commands (Array).
-            
-            // Let's assume the AI provides CLI-like syntax and we try to run it via a helper,
-            // OR we tell the AI to use valid JSON structure?
-            // "execute_command" usually implies the AI knows the RouterOS console syntax.
-            // We can wrap it in a system script or use the API's "command" capability if strictly supported.
-            
-            // SIMPLIFICATION:
-            // For this MVP, since we are using pear2/routeros or similar under the hood (in factories),
-            // The V6Adapter using RouterOS API usually takes a MENU and Action.
-            // CLI: /ip address add address=...
-            // API: /ip/address/add, =address=...
-            
-            // Let's UPDATE the PROMPT/DESCRIPTION to ask for the API format if needed, 
-            // OR we implement a parser.
-            // PROMPT ENGINEERING IS EASIER: Update description to ask for specific format? 
-            // "command" string is risky.
-            
-            // ALTERNATIVE:
-            // Does RouterOS API support "exec"? No.
-            // But we can use /system/script/run ... no.
-            
-            // Let's try to pass the command directly. 
-            // If the user's library supports "query", we might need to parse.
-            // Let's do a basic parser from CLI string to API array.
-            
             $cmdString = $arguments['command'];
             
-            // Basic Parsing Logic (Naive)
-            // 1. Split by space to get Main Command part vs Arguments.
-            // Example: /ip hotspot user add name=guest password=123
-            // Parts: /ip, hotspot, user, add
-            // Args: name=guest, password=123
-            
-            // Actual API Command: /ip/hotspot/user/add
-            
-            // Removing starting / if present
-            $cmdString = ltrim($cmdString, '/');
-            $parts = preg_split('/\s+/', $cmdString);
-            
-            $apiPath = "";
-            $apiArgs = [];
-            
-            foreach ($parts as $part) {
-                if (str_contains($part, '=')) {
-                    // It's an argument
-                    // API expects key=value (sometimes with = prefix)
-                    // PEAR2/Client usually handles the = prefix if we pass as array.
-                    $kv = explode('=', $part, 2);
-                    $apiArgs[$kv[0]] = $kv[1] ?? '';
-                } else {
-                    // It's part of the path
-                    $apiPath .= "/" . $part;
-                }
-            }
+            // ENHANCED: Parse command with query support
+            $parsed = $this->parseCommand($cmdString);
             
             // Execute via Adapter
-            // We need to extend our Adapter interface to support "execute($path, $args)"
-            // Currently it has specific methods. Let's assume we can add a generic `query` or `write`.
-            // Let's check the Adapter first, but for now, let's assume we add this capability.
-            
-            if (method_exists($adapter, 'write')) {
-                // Low level access
-                // This depends heavily on the implementation of RouterOsAdapterInterface.
-                // Let's assume we act "Smart" and try to use a generic method we will add.
-                $response = $adapter->comm($apiPath, $apiArgs);
+            if (method_exists($adapter, 'comm')) {
+                $response = $adapter->comm($parsed['path'], $parsed['args'], $parsed['queries']);
+            } elseif (method_exists($adapter, 'write')) {
+                $response = $adapter->write($parsed['path'], $parsed['args']);
             } else {
                 throw new Exception("Adapter does not support generic commands.");
             }
@@ -131,15 +218,91 @@ class ExecuteRouterCommandTool extends BaseTool
             return [
                 'status' => 'success',
                 'output' => $response,
-                'message' => "Command executed: $cmdString"
+                'command_path' => $parsed['path'],
+                'message' => "Command executed successfully"
             ];
 
         } catch (Exception $e) {
             return [
                 'status' => 'error',
                 'error' => $e->getMessage(),
-                'suggestion' => 'Check syntax. Use RouterOS API format.'
+                'suggestion' => 'Check syntax. Use RouterOS API format: /menu/submenu/action =arg=value'
             ];
+        }
+    }
+
+    /**
+     * ENHANCED: Parse RouterOS command with query support
+     * Supports: /path/to/menu, =attribute=value, ?query, .proplist
+     */
+    private function parseCommand(string $command): array
+    {
+        $command = trim($command);
+        $command = ltrim($command, '/');
+        
+        // Split by whitespace but preserve quoted strings
+        $parts = preg_split('/\s+(?=(?:[^"]*"[^"]*")*[^"]*$)/', $command);
+        
+        $path = "";
+        $args = [];
+        $queries = [];
+        
+        foreach ($parts as $part) {
+            $part = trim($part, '"'); // Remove quotes
+            
+            if (str_starts_with($part, '?')) {
+                // Query word (e.g., ?type=ether, ?name, ?#|)
+                // RouterOS API query format
+                $queries[] = $part;
+            } elseif (str_starts_with($part, '.')) {
+                // API attribute (e.g., .proplist=name,address, .tag=myTag)
+                if (str_contains($part, '=')) {
+                    $kv = explode('=', substr($part, 1), 2);
+                    $args['.' . $kv[0]] = $kv[1] ?? '';
+                }
+            } elseif (str_contains($part, '=')) {
+                // Regular attribute (e.g., address=192.168.1.1, name=test)
+                $kv = explode('=', $part, 2);
+                $args[$kv[0]] = $kv[1] ?? '';
+            } else {
+                // Path component (e.g., ip, address, add)
+                $path .= "/" . $part;
+            }
+        }
+        
+        return [
+            'path' => $path,
+            'args' => $args,
+            'queries' => $queries,
+        ];
+    }
+
+    // FIXED: Security validation method
+    private function validateCommand(string $command): void
+    {
+        // Normalize: convert CLI format to API format for checking
+        $normalizedCmd = str_replace(' ', '/', ltrim($command, '/'));
+        $normalizedCmd = preg_replace('/\/+/', '/', $normalizedCmd); // Remove double slashes
+        $normalizedCmd = '/' . explode('=', $normalizedCmd)[0]; // Get only the path part
+        
+        // Check blocked patterns first (highest priority)
+        foreach (self::BLOCKED_PATTERNS as $pattern) {
+            if (preg_match($pattern, $normalizedCmd)) {
+                throw new Exception("Command blocked for security reasons. This action is not permitted via AI.");
+            }
+        }
+        
+        // Check if matches any allowed pattern
+        $isAllowed = false;
+        foreach (self::ALLOWED_COMMAND_PATTERNS as $pattern) {
+            if (preg_match($pattern, $normalizedCmd)) {
+                $isAllowed = true;
+                break;
+            }
+        }
+        
+        if (!$isAllowed) {
+            throw new Exception("Command not in allowed list. Contact admin to add this command to the whitelist: " . $normalizedCmd);
         }
     }
 }

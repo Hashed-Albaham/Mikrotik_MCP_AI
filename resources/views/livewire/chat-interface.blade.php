@@ -12,6 +12,14 @@
         }
      }"
      x-init="scrollToBottom()"
+     x-on:trigger-auto-tool.window="
+        if(autoPilot) {
+            watchdogStatus = 'executing';
+            $wire.handleAutoToolExecution($event.detail.tool, $event.detail.id, $event.detail.args)
+                .then(() => watchdogStatus = 'idle');
+        }
+     "
+     x-on:generate-ai-response.window="$wire.generateResponse($event.detail.messageId)"
      @message-sent.window="pendingMessage = ''; scrollToBottom()"
 >
     <!-- Sidebar -->
@@ -57,7 +65,7 @@
                 <div class="relative">
                     <select wire:model.live="activeRouterId" class="w-full appearance-none bg-gray-800/50 border border-blue-500/30 text-white text-sm rounded-xl pl-10 pr-4 py-2.5 focus:outline-none focus:ring-1 focus:ring-blue-500 hover:bg-gray-800 transition-colors cursor-pointer">
                         @foreach($routers as $router)
-                            <option value="{{ $router->id }}">{{ $router->name }} ({{ $router->host }})</option>
+                            <option value="{{ $router->id }}">{{ $router->name }}</option>
                         @endforeach
                     </select>
                     <div class="absolute left-3 top-2.5 text-blue-400 pointer-events-none">
@@ -163,8 +171,21 @@
                         
                         <div class="flex flex-col gap-2 max-w-[80%] md:max-w-[70%]">
                             <div class="px-6 py-4 rounded-2xl shadow-sm {{ $msg['role'] === 'user' ? 'bg-gradient-to-r from-blue-600 to-indigo-600 text-white rounded-tr-none' : 'glass rounded-tl-none text-gray-200' }}">
-                                <div class="prose prose-invert prose-sm">
-                                    {{ $msg['content'] }}
+                                <div class="prose prose-invert prose-sm" 
+                                     @if($msg['role'] === 'assistant')
+                                        wire:stream="msg-{{ $msg['id'] }}-content"
+                                        id="msg-{{ $msg['id'] }}-content"
+                                     @endif
+                                >
+                                    @if(empty($msg['content']) && $msg['role'] === 'assistant')
+                                        <div class="flex space-x-1 h-5 items-center">
+                                            <div class="w-2 h-2 bg-gray-400 rounded-full animate-bounce"></div>
+                                            <div class="w-2 h-2 bg-gray-400 rounded-full animate-bounce delay-75"></div>
+                                            <div class="w-2 h-2 bg-gray-400 rounded-full animate-bounce delay-150"></div>
+                                        </div>
+                                    @else
+                                        {{ $msg['content'] }}
+                                    @endif
                                 </div>
                             </div>
 
@@ -240,18 +261,24 @@
 
         <!-- FIXED WATCHDOG OVERLAY (Moved outside container for z-index safety) -->
         <div x-show="watchdogStatus !== 'idle'" x-transition 
-             class="fixed top-20 left-1/2 transform -translate-x-1/2 z-[100] flex justify-center pointer-events-none">
-            <div class="glass px-5 py-2.5 rounded-full flex items-center gap-3 border border-brand-500/50 shadow-2xl shadow-brand-500/30 backdrop-blur-xl bg-black/60 pointer-events-auto">
+             class="fixed top-20 left-1/2 transform -translate-x-1/2 z-[100] flex flex-col items-center pointer-events-none">
+            <div class="glass px-6 py-3 rounded-full flex items-center gap-4 border border-brand-500/50 shadow-2xl shadow-brand-500/30 backdrop-blur-xl bg-black/80 pointer-events-auto">
                 <!-- Radar Animation -->
-                <div class="relative w-3 h-3">
+                <div class="relative w-3 h-3 flex-shrink-0">
                     <span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-brand-400 opacity-75"></span>
                     <span class="relative inline-flex rounded-full h-3 w-3 bg-brand-500"></span>
                 </div>
                 
-                <span class="text-xs font-bold font-mono tracking-widest text-brand-300 uppercase glow-text" x-text="watchdogStatus === 'executing' ? 'AUTONOMOUS AGENT ACTIVE' : 'VERIFYING COMPLETION...'"></span>
+                <div class="flex flex-col">
+                    <span class="text-[10px] font-bold font-mono tracking-widest text-brand-300 uppercase glow-text" 
+                          x-text="watchdogStatus === 'executing' ? 'AUTONOMOUS AGENT ACTIVE' : 'VERIFYING COMPLETION...'">
+                    </span>
+                    <!-- Dynamic Command Display -->
+                    <span class="text-[9px] text-gray-400 font-mono mt-0.5" x-text="$wire.activeToolName ? 'Cmd: ' + $wire.activeToolName : 'Processing...'"></span>
+                </div>
                 
                 <!-- Stop Button -->
-                <button type="button" @click="autoPilot = false; watchdogStatus = 'idle'" class="ml-3 p-1 hover:bg-white/20 rounded-full text-gray-400 hover:text-white transition group" title="Emergency Stop">
+                <button type="button" @click="autoPilot = false; watchdogStatus = 'idle'" class="ml-2 p-1.5 hover:bg-red-500/20 rounded-full text-gray-400 hover:text-red-400 transition group border border-transparent hover:border-red-500/30" title="Emergency Stop">
                     <svg class="w-4 h-4 group-hover:scale-110 transition-transform" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
                 </button>
             </div>
@@ -262,40 +289,13 @@
             <div class="max-w-4xl mx-auto relative group">
                 <div class="absolute -inset-1 bg-gradient-to-r from-brand-500 to-purple-600 rounded-2xl blur opacity-20 group-hover:opacity-40 transition duration-1000 group-hover:duration-200"></div>
                 <form 
-                    x-data
-                    x-effect="
-                        (function() {
-                            var msgs = @js($messages);
-                            if (msgs.length > 0) {
-                                var lastMsg = msgs[msgs.length - 1];
-                                if (lastMsg.role === 'assistant' && lastMsg.tool_calls && lastMsg.tool_calls.length > 0) {
-                                    lastMsg.tool_calls.forEach(function(tc) {
-                                        if (tc.function.name === 'execute_router_command') {
-                                            console.log('Auto-Executing:', tc.function.name);
-                                            $wire.handleAutoToolExecution(
-                                                tc.function.name, 
-                                                tc.id, 
-                                                JSON.parse(tc.function.arguments)
-                                            );
-                                        }
-                                    });
-                                }
-                            }
-                        })();
-                    "
-                    x-on:submit.prevent="
-                        if(!$wire.input.trim() && !$wire.upload) return; 
-                        pendingMessage = $wire.input; 
-                        $wire.sendMessage($wire.input); 
-                        $wire.input = ''; 
-                        $wire.upload = null; 
-                        scrollToBottom();
-                    " 
+                    wire:submit.prevent="submitMessage"
                     class="relative"
                 >
                     <input 
-                        wire:model="input" 
+                        wire:model.live="input" 
                         type="text" 
+                        placeholder="اكتب رسالتك هنا..."
                         class="w-full bg-gray-900 text-white placeholder-gray-500 border border-white/10 rounded-xl pl-12 pr-14 py-4 focus:outline-none focus:ring-0 shadow-2xl transition-all"
                         autofocus
                     >
@@ -331,3 +331,5 @@
                 </div>
             </div>
         </div>
+    </main>
+</div>

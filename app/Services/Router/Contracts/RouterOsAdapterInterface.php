@@ -1,5 +1,7 @@
 <?php
 
+// 🛡️ SEC: Strict types prevent type confusion attacks [source:2]
+declare(strict_types=1);
 namespace App\Services\Router\Contracts;
 
 interface RouterOsAdapterInterface
@@ -28,11 +30,13 @@ interface RouterOsAdapterInterface
     public function addHotspotUser(string $name, string $password, string $profile, ?string $server = 'all'): array;
 
     /**
-     * Generic communication method.
+     * Generic communication method with query support.
+     * // 🏛️ ARCH: Added queries parameter for API filtering [source:1]
      * @param string $path e.g. "/ip/address/add"
      * @param array $args e.g. ["address" => "192.168.1.1/24", "interface" => "ether1"]
+     * @param array $queries e.g. ["?type=ether", "?disabled=false"]
      */
-    public function comm(string $path, array $args = []): array;
+    public function comm(string $path, array $args = [], array $queries = []): array;
 
     /**
      * Reboot the router.
