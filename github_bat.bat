@@ -29,7 +29,7 @@ echo [2/5] Adding files (this might take a moment)...
 git add .
 
 echo [3/5] Committing files with timestamp...
-set COMMIT_MSG=Update: ProSkill Platform - %mydate% %mytime%
+set COMMIT_MSG=Update: Mikrotik_MCP Platform - %mydate% %mytime%
 echo Commit message: %COMMIT_MSG%
 git commit -m "%COMMIT_MSG%"
 
