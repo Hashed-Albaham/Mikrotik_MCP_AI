@@ -1,0 +1,155 @@
+🧬 THE MASTER CONSTRUCTOR PROMPT
+# ACT AS: Senior Enterprise Architect & Lead Full-Stack Developer
+
+## PROJECT: AI-NET-ORCHESTRATOR (SaaS Edition)
+**Stack:** Laravel  (PHp), MySQL , Livewire (or Vue ), TailwindCSS, Redis, Laravel Horizon.
+php and mysqul is running in xamp
+and add routermikrotik api 
+**Architecture:** Model Context Protocol (MCP) + Strategy Pattern + Factory Pattern.
+
+---
+
+## 1. CORE MISSION & IDENTITY
+You are building a "Chat-Ops" Network Management System.
+**The Goal:** A user chats with an AI (e.g., "Disconnect user Ahmed"), and the system translates this intent into a RouterOS API command, executes it on a Mikrotik router, and returns the result.
+
+**CRITICAL REQUIREMENT: UNIVERSAL AGNOSTIC DESIGN**
+1.  **AI Agnostic:** DO NOT hardcode Gemini or OpenAI classes. You MUST build a "Universal Connector" that reads `base_url` and `api_key` from the database. This allows the admin to add ANY model (Ollama, DeepSeek, Google, OpenAI) dynamically via the UI.
+2.  **Router Agnostic:** The system MUST auto-detect RouterOS versions (v6 vs v7) and switch command syntax automatically using a Factory Pattern.
+
+---
+
+## 2. DATABASE SCHEMA (ABSOLUTE TRUTH)
+You must implement the following schema EXACTLY. This is the backbone of the system.
+
+```sql
+-- 1. USERS
+CREATE TABLE users (
+    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    name VARCHAR(255) NOT NULL,
+    email VARCHAR(255) UNIQUE NOT NULL,
+    password VARCHAR(255) NOT NULL,
+    role ENUM('superadmin', 'admin', 'user') DEFAULT 'user',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+);
+
+-- 2. DYNAMIC AI PROVIDERS (The Universal Brain)
+CREATE TABLE ai_providers (
+    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    name VARCHAR(100) NOT NULL, -- e.g., "Gemini Pro", "Local Ollama"
+    base_url VARCHAR(255) NOT NULL, -- e.g., "[https://api.openai.com/v1](https://api.openai.com/v1)" or "http://localhost:11434/v1"
+    api_key VARCHAR(255) NULL, -- Encrypted. Nullable for local LLMs
+    model_identifier VARCHAR(100) NOT NULL, -- e.g., "gpt-4-turbo", "gemini-1.5-flash"
+    context_window INT DEFAULT 128000,
+    is_active BOOLEAN DEFAULT TRUE,
+    supports_tools BOOLEAN DEFAULT TRUE -- Does it support Function Calling?
+);
+
+-- 3. MIKROTIK ROUTERS
+CREATE TABLE routers (
+    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    user_id BIGINT UNSIGNED NOT NULL,
+    name VARCHAR(255) NOT NULL,
+    host VARCHAR(255) NOT NULL, -- IP or Domain
+    port INT DEFAULT 8728,
+    username VARCHAR(255) NOT NULL,
+    password TEXT NOT NULL, -- MUST BE ENCRYPTED
+    os_version VARCHAR(20) NULL, -- detected automatically, e.g., "6.49" or "7.12"
+    status ENUM('online', 'offline') DEFAULT 'offline',
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+
+-- 4. MCP TOOLS REGISTRY (Capabilities)
+CREATE TABLE mcp_tools (
+    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    name VARCHAR(100) UNIQUE NOT NULL, -- e.g., "add_hotspot_user"
+    description TEXT NOT NULL,
+    parameters_schema JSON NOT NULL, -- The JSON Schema for the AI
+    requires_confirmation BOOLEAN DEFAULT FALSE, -- Dangerous tools (reboot) need UI confirmation
+    min_role ENUM('user', 'admin') DEFAULT 'admin'
+);
+
+-- 5. CHAT SESSIONS & MESSAGES
+CREATE TABLE chat_sessions (
+    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    user_id BIGINT UNSIGNED NOT NULL,
+    provider_id BIGINT UNSIGNED NOT NULL, -- Which brain is being used?
+    title VARCHAR(255),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (provider_id) REFERENCES ai_providers(id)
+);
+
+CREATE TABLE chat_messages (
+    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    session_id BIGINT UNSIGNED NOT NULL,
+    role ENUM('user', 'assistant', 'system', 'tool') NOT NULL,
+    content TEXT, -- Human readable text
+    tool_calls JSON NULL, -- Stores the raw tool call from AI
+    ui_widget JSON NULL, -- Instructions for Frontend (e.g., Show Form, Show PDF Button)
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 6. VOUCHER BATCHES
+CREATE TABLE voucher_batches (
+    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    router_id BIGINT UNSIGNED NOT NULL,
+    profile VARCHAR(255),
+    count INT,
+    pdf_path VARCHAR(255) NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+3. ARCHITECTURAL BLUEPRINT (Backend)
+A. The Universal AI Service (App\Services\AiOrchestrator)
+ * Logic:
+   * Fetch the "Active" provider from DB.
+   * Prepare the HTTP Client (using Laravel Http).
+   * Load available tools from mcp_tools table -> convert to OpenAI-compatible Tool Schema.
+   * Send Request -> Receive Response.
+   * Crucial: If response is a "Tool Call", do NOT execute immediately if requires_confirmation is true. Return a "Confirmation Widget" to the UI.
+B. The RouterOS Factory (App\Services\RouterOs)
+ * Interface: RouterOsAdapterInterface (methods: connect, getUsers, addUser, reboot, etc.)
+ * Classes:
+   * RouterOsV6Adapter: Implements logic using v6 syntax.
+   * RouterOsV7Adapter: Implements logic using v7 syntax.
+ * Factory: RouterOsFactory::make($router) -> Connects, checks version, returns the correct Adapter.
+C. The MCP Tool Definitions (App\Mcp\Tools)
+ * Create an abstract class BaseTool.
+ * Create specific classes: ConnectRouterTool, GenerateVouchersTool, GetSystemHealthTool.
+ * Self-Discovery: Create a command php artisan mcp:sync that scans these classes and updates the mcp_tools database table.
+4. FRONTEND BLUEPRINT (Generative UI)
+A. The Chat Interface (Livewire/Vue)
+ * Layout: Full screen, strictly modeled after ChatGPT/Claude UI.
+ * The "Renderer" Component:
+   * Instead of just displaying text, it must parse the ui_widget JSON field from the message.
+   * Scenario 1 (Input needed): If AI sends { type: 'form', fields: [...] }, render a Tailwind Form.
+   * Scenario 2 (Confirmation): If AI sends { type: 'confirm', warning: 'Rebooting...' }, render a red Modal.
+   * Scenario 3 (Success): If AI sends { type: 'download', url: '...' }, render a Download Button.
+B. The Admin Dashboard
+ * Providers Page: A CRUD table to add new AI models. Inputs: (Name, Base URL, API Key, Model ID).
+ * Routers Page: Add/Edit Routers. status indicator (ping).
+ * Tools Page: A list of all MCP Tools with Toggle Switches (Enable/Disable for specific user roles).
+5. EXECUTION PLAN (Step-by-Step)
+STEP 1: SCAFFOLDING
+ * Initialize Laravel project.
+ * Install benmenking/routeros-api.
+ * Create all Migrations based on the Schema above.
+ * Run Migrations.
+STEP 2: THE ADAPTERS (The Hands)
+ * Create RouterOsFactory.
+ * Implement RouterOsV6Adapter and RouterOsV7Adapter with a simple method getSystemResource() to test differences.
+STEP 3: THE BRAIN (The AI)
+ * Create AiConnectorService. Make it accept a dynamic URL/Key.
+ * Implement the "Tool Schema Generator" (converts PHP classes to JSON schemas).
+STEP 4: THE MCP REGISTRY
+ * Create the GenerateVouchersTool class.
+ * Write the logic to sync it to the DB.
+STEP 5: THE UI (The Face)
+ * Build the Chat Component (Livewire).
+ * Implement the WidgetRenderer.
+STEP 6: INTEGRATION
+ * Connect the Chat Component -> AI Service -> Router Factory.
+6. FINAL INSTRUCTION
+START NOW. Begin by creating the Database Migrations and the Directory Structure for the Services and Tools. Then, proceed to implement the Universal AI Service.
+Write production-ready code with proper error handling (Try/Catch) and DocBlocks.
